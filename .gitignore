@@ -1,0 +1,29 @@
+# --- 1. Security (CRITICAL) ---
+.env
+.env.*
+*.pem
+secrets.json
+
+# --- 2. Python & Pydantic AI Garbage ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- 3. Virtual Environments ---
+# Poetry usually makes a .venv, but we catch others just in case
+.venv/
+venv/
+env/
+ENV/
+
+# --- 4. Logs & Debugging ---
+*.log
+pydantic_ai_debug.log
+
+# --- 6. Mac OS Annoyances ---
+.DS_Store
