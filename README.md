@@ -70,11 +70,3 @@ We do not test by "vibes." We test by assertions.
 ### Level 3: Logic Tests (Real LLM / "The Gauntlet")
 * **The Ambiguity Test:** Input: *"Make sure the thing works."* -> Expect: Error or request for clarification (Agent shouldn't guess).
 * **The Conflict Test:** Input: *"Project is due Monday. Actually, make it Tuesday."* -> Expect: Due date = Tuesday.
-
----
-
-## 5. Immediate Checklist
-- [ ] **Environment:** `pip install pydantic-ai devtools python-dotenv`
-- [ ] **Auth:** Get Trello API Key + Token. Add to `.env`.
-- [ ] **Model:** Define the `TrelloCard` Pydantic class.
-- [ ] **Prototype:** Write `agent.py` that prints a card to console (no API call yet).
