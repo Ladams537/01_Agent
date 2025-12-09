@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from typing import Any, Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -10,11 +10,9 @@ from pydantic_ai import Agent
 
 load_dotenv()
 
-# --- 1. DEFINE DATA MODELS ---
 
-
-# The "Draft" Object
 class TrelloCard(BaseModel):
+    id: Optional[str] = None
     title: str
     description: str
     tag: Literal["Bug", "Feature", "Docs"]
@@ -26,7 +24,7 @@ class Plan(BaseModel):
 
 
 class ExecutionResult(BaseModel):
-    output_data: Optional[TrelloCard] = None  # Holds our draft
+    output_data: Optional[TrelloCard] = None
     success: bool
     error_message: Optional[str] = None
 
@@ -42,43 +40,78 @@ class AgentState(BaseModel):
         "planning", "executing", "evaluating", "committing", "done", "failed"
     ] = "planning"
     scratchpad: List[str] = Field(default_factory=list)
-    draft_card: Optional[TrelloCard] = None  # Store the safe draft here
+    draft_card: Optional[TrelloCard] = None
     retry_count: int = 0
     max_retries: int = 3
     final_result: Optional[str] = None
 
 
-# --- 2. THE AGENT (GENERATOR ONLY) ---
+def search_trello_tool(query: str) -> str:
+    """Searches Trello for card on configured board."""
+    print(f"   >>> [Tool Call] Searching Trello for: '{query}'...")
 
-# Notice: No tools here! Just pure data generation.
+    url = "https://api.trello.com/1/search"
+    params = {
+        "key": os.getenv("TRELLO_API_KEY"),
+        "token": os.getenv("TRELLO_API_TOKEN"),
+        "query": query,
+        "idBoards": os.getenv("TRELLO_BOARD_ID"),
+        "modelTypes": "cards",
+        "card_fields": "name,desc,idList",
+        "card_limit": 5,
+    }
+
+    resp = requests.get(url, params)
+    if resp.status_code == 200:
+        cards = resp.json().get("cards", [])
+        if not cards:
+            return f"No cards found matching '{query}'."
+
+        summary = []
+        for c in cards:
+            summary.append(
+                f"CARD_ID: {c['id']} | TITLE: {c['name']} | DESC: {c['desc'][:50]}"
+            )
+        return "\n".join(summary)
+    return f"Error searching Trello: {resp.text}"
+
+
 planner_agent = Agent(
     "google-gla:gemini-2.5-flash-lite",
     output_type=Plan,
+    tools=[search_trello_tool],
     system_prompt=(
-        "You are a Project Manager. Break down the user's request into clear, logical steps. "
-        "Your plan must be actionable."
+        "You are a Project Manager. "
+        "1. ALWAYS search Trello first. Use simple keywords (e.g., 'login' instead of 'fix login bug'). "
+        "2. If a card is found, your plan MUST be: 'Update card [INSERT_EXACT_ID_HERE]'. "
+        "   Example: 'Update card 60d5ec...' "
+        "3. If no card is found, your plan is to 'Create a new card'. "
+        "4. Include all details (assignee, priority) in the plan steps."
     ),
 )
+
 
 executor_agent = Agent(
     "google-gla:gemini-2.5-flash-lite",
     output_type=TrelloCard,
-    system_prompt="You are a Task Drafter. Create a TrelloCard object based on the user request and plan.",
+    system_prompt=(
+        "You are a Task Drafter. "
+        "Rules:"
+        "1. If the plan mentions a specific Card ID (alphanumeric like 60d5...), put it in the 'id' field."
+        "2. NEVER put a person's name (like 'Shelley') in the 'id' field."
+        "3. If the plan says 'Create new', leave 'id' as None."
+        "4. Put assignee names and priority levels in the 'description' field."
+    ),
 )
-
-# --- 3. THE WORKFLOW NODES ---
 
 
 async def run_planner(state: AgentState) -> Plan:
     print(f"--- [Planner] Thinking about: {state.input_query} ---")
 
-    # We ask the LLM to generate the plan dynamically
     result = await planner_agent.run(state.input_query)
 
-    # PydanticAI automatically validates the output against the Plan model
     plan = result.output
 
-    # Optional: Print the reasoning to see the brain working
     print(f"    > Reasoning: {plan.reasoning}")
     print(f"    > Steps: {plan.steps}")
 
@@ -116,52 +149,63 @@ async def run_evaluator(state: AgentState) -> Evaluation:
 
     draft = state.draft_card
 
-    # 1. Sanity Check
     if not draft:
         return Evaluation(decision="reject", critique="No card was generated.")
 
-    # 2. Rule Check (Example: Description must be detailed)
-    if len(draft.description) < 10:
-        return Evaluation(
-            decision="reject",
-            critique="Description is too short. Please provide more detail.",
-        )
-
-    # 3. Tag Check
-    if draft.tag not in ["Bug", "Feature", "Docs"]:
-        return Evaluation(decision="reject", critique="Invalid Tag.")
+    if draft.id:
+        if len(draft.id) < 10 or " " in draft.id:
+            return Evaluation(
+                decision="reject",
+                critique=f"The ID '{draft.id}' is invalid. It looks like a name or title. "
+                "The ID must be the alphanumeric hash found by the Search tool.",
+            )
 
     return Evaluation(decision="approve")
 
 
 async def run_committer(state: AgentState):
-    """The only place where side effects happen."""
     print("--- [Committer] 🚀 Push to Trello API ---")
 
     card = state.draft_card
     if not card:
         return "Error: No card to commit"
 
-    url = "https://api.trello.com/1/cards"
-    query = {
+    base_params = {
         "key": os.getenv("TRELLO_API_KEY"),
         "token": os.getenv("TRELLO_TOKEN"),
-        "idList": os.getenv("TRELLO_LIST_ID"),
-        "name": f"[{card.tag}] {card.title}",
-        "desc": card.description,
-        "pos": "top",
     }
 
-    # REAL API CALL
-    response = requests.post(url, params=query)
+    # LOGIC BRANCH: UPDATE vs CREATE
+    if card.id:
+        # --- UPDATE EXISTING CARD ---
+        print(f"   Action: Updating Card {card.id}")
+        url = f"https://api.trello.com/1/cards/{card.id}"
+        query = {
+            **base_params,
+            "name": f"[{card.tag}] {card.title}",
+            "desc": card.description,
+        }
+        response = requests.put(url, params=query)  # PUT
+        action_type = "Updated"
+
+    else:
+        # --- CREATE NEW CARD ---
+        print("   Action: Creating New Card")
+        url = "https://api.trello.com/1/cards"
+        query = {
+            **base_params,
+            "idList": os.getenv("TRELLO_LIST_ID"),
+            "name": f"[{card.tag}] {card.title}",
+            "desc": card.description,
+            "pos": "top",
+        }
+        response = requests.post(url, params=query)  # POST
+        action_type = "Created"
 
     if response.status_code == 200:
-        return f"SUCCESS: Created card {response.json().get('shortUrl')}"
+        return f"SUCCESS: {action_type} card {response.json().get('shortUrl')}"
     else:
         return f"API ERROR: {response.text}"
-
-
-# --- 4. THE ORCHESTRATOR ---
 
 
 async def run_workflow(user_query: str):
@@ -171,12 +215,10 @@ async def run_workflow(user_query: str):
     print(f"Starting Workflow: {user_query}")
 
     while state.current_step not in ["done", "failed"]:
-        # --- PHASE 1: PLAN ---
         if state.current_step == "planning":
             current_plan = await run_planner(state)
             state.current_step = "executing"
 
-        # --- PHASE 2: EXECUTE (DRAFT) ---
         elif state.current_step == "executing":
             if not current_plan:
                 raise ValueError("No Plan!")
@@ -187,13 +229,11 @@ async def run_workflow(user_query: str):
                 state.draft_card = exec_result.output_data
                 state.current_step = "evaluating"
             else:
-                # Agent crashed generation
                 state.retry_count += 1
                 print(f"Executor Crashed: {exec_result.error_message}")
                 if state.retry_count > state.max_retries:
                     state.current_step = "failed"
 
-        # --- PHASE 3: EVALUATE ---
         elif state.current_step == "evaluating":
             evaluation = await run_evaluator(state)
 
@@ -206,19 +246,15 @@ async def run_workflow(user_query: str):
                 if evaluation.critique is None:
                     print("No critique provided")
                 else:
-                    state.scratchpad.append(
-                        evaluation.critique
-                    )  # Pass feedback to history
+                    state.scratchpad.append(evaluation.critique)
 
                 if state.retry_count > state.max_retries:
                     print("!!! MAX RETRIES REACHED !!!")
                     state.current_step = "failed"
                     state.final_result = "Human Handoff Required"
                 else:
-                    # Loop back to try drafting again
                     state.current_step = "executing"
 
-        # --- PHASE 4: COMMIT (SIDE EFFECT) ---
         elif state.current_step == "committing":
             result_msg = await run_committer(state)
             state.final_result = result_msg
@@ -227,11 +263,8 @@ async def run_workflow(user_query: str):
     return state
 
 
-# --- MAIN ---
-
-
 async def main():
-    final_state = await run_workflow("Fix the login page crashing on iOS")
+    final_state = await run_workflow("Update the login bug.")
     print(f"\nFINAL RESULT: {final_state.final_result}")
 
 
